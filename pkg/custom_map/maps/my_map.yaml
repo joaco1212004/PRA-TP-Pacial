@@ -1,0 +1,11 @@
+image: my_map.pgm
+mode: trinary
+resolution: 0.05
+origin: [-5.05, -11.1, 0]
+negate: 0
+occupied_thresh: 0.65
+# 0.25 rounds the unknown band away. map_saver writes unknown as pixel 205, and
+# map_io scores a pixel as (255 - value) / 255 = 0.196 for that value, so any
+# free_thresh above 0.196 loads all 7297 unexplored cells here as free space and
+# RViz shows them white instead of grey. nav2_bringup's own map ships 0.196.
+free_thresh: 0.196

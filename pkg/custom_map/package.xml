@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>custom_map</name>
+  <version>0.0.0</version>
+  <description>Custom cafe world, its Gazebo models and a recorded occupancy map, with one launch file that starts the simulation, serves the map and opens RViz on it</description>
+  <maintainer email="tadeo.casiraghi@gmail.com">udesa</maintainer>
+  <license>BSD-3-Clause</license>
+
+
+  <!-- cafe.launch.py includes this package's simulation launch file and reads
+       its share directory. Without the declaration the package builds and then
+       fails at launch on a machine where only its own dependencies exist. -->
+  <exec_depend>yahboom_rosmaster_gazebo</exec_depend>
+  <exec_depend>yahboom_rosmaster_description</exec_depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- Serving the map. Not localisation: nothing here estimates a pose. -->
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <!-- features.py importa cv2 y feature_finder.py numpy: sin declararlos, en una
+       maquina limpia el nodo muere con ModuleNotFoundError, /landmarks nunca sale
+       y la seccion 2 se queda sin sensor, sin ningun error visible. -->
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+
+  <exec_depend>rviz2</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

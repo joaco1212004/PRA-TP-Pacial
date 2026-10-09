@@ -1,0 +1,91 @@
+<?xml version="1.0" ?>
+<!-- Gazebo Classic build of the custom cafe.
+
+     cafe.world is a Fortress world. <physics type="ignored"> is a Fortress-only
+     token, and Classic does not fail softly on it: it aborts the whole load
+     with "Invalid Physics Type[ignored]" / "Unable to create physics engine".
+     The six gz-sim-* system plugins do not exist in a Classic install either.
+     Classic is the only backend with a working lidar on macOS, so the world it
+     needs is kept as its own file rather than patched at launch time.
+
+     Geometry, poses and model URIs are identical to cafe.world; only the
+     physics block, the plugin list and the light syntax differ. Keep the two in
+     sync when either changes. -->
+<sdf version="1.6">
+  <world name="default">
+    <physics name="1ms" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <scene>
+      <ambient>0.5 0.5 0.5 1</ambient>
+      <background>0.7 0.8 0.9 1</background>
+      <shadows>false</shadows>
+    </scene>
+
+    <light name="sun" type="directional">
+      <cast_shadows>0</cast_shadows>
+      <pose>0 0 10 0 -0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>0 0.5 -0.9</direction>
+    </light>
+
+    <light name="point_light" type="point">
+      <pose>0 -0.377195 6.59868 0 -0 0</pose>
+      <diffuse>0.784314 0.784314 0.784314 1</diffuse>
+      <specular>0.0980392 0.0980392 0.0980392 1</specular>
+      <attenuation>
+        <range>50</range>
+        <constant>0.8</constant>
+        <linear>0</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <cast_shadows>0</cast_shadows>
+    </light>
+
+    <include>
+      <pose>0 0 -0.1898 0 0 0</pose>
+      <uri>model://custom_cafe</uri>
+    </include>
+
+    <include>
+      <name>table1</name>
+      <pose>0.5 -1.6 0 0 0 0</pose>
+      <uri>model://custom_cafe_table</uri>
+    </include>
+
+    <include>
+      <name>table2</name>
+      <pose>2.4 -5.5 0 0 0 0</pose>
+      <uri>model://custom_cafe_table</uri>
+    </include>
+
+    <include>
+      <name>table3</name>
+      <pose>-1.5 -5.5 0 0 0 0</pose>
+      <uri>model://custom_cafe_table</uri>
+    </include>
+
+    <include>
+      <name>table4</name>
+      <pose>2.4 -9 0 0 0 0</pose>
+      <uri>model://custom_cafe_table</uri>
+    </include>
+
+    <include>
+      <name>table5</name>
+      <pose>-1.5 -9 0 0 0 0</pose>
+      <uri>model://custom_cafe_table</uri>
+    </include>
+
+  </world>
+</sdf>
