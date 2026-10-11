@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+"""Localizacion 2D por EKF: prediccion odometrica y correccion por landmarks."""
 
+import math
 import numpy as np
 
-
-# Patch for deprecated numpy aliases
+# Compatibilidad con bibliotecas que aun utilizan los alias viejos de NumPy.
 if not hasattr(np, 'float'):
     np.float = float
 if not hasattr(np, 'int'):
@@ -11,22 +12,24 @@ if not hasattr(np, 'int'):
 if not hasattr(np, 'bool'):
     np.bool = bool
 
-    
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import PointCloud2, PointField, LaserScan
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import (
+    Quaternion, PoseStamped, PoseWithCovarianceStamped, PoseArray
+)
 from scipy.spatial.transform import Rotation as R
-from std_msgs.msg import Header
-from nav_msgs.msg import OccupancyGrid
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, PoseArray
-from geometry_msgs.msg import Quaternion
-import math
+from scipy.optimize import linear_sum_assignment
+
+
+def normalize_angle(angle):
+    """Normaliza un angulo al intervalo [-pi, pi]."""
+    return math.atan2(math.sin(angle), math.cos(angle))
+
 
 def yaw_to_quaternion(yaw):
-    """Convert a yaw angle (in radians) into a Quaternion message."""
+    """Convierte un angulo yaw a un Quaternion de ROS."""
     q = Quaternion()
     q.w = math.cos(yaw * 0.5)
     q.x = 0.0
@@ -34,64 +37,355 @@ def yaw_to_quaternion(yaw):
     q.z = math.sin(yaw * 0.5)
     return q
 
+
 class EKFNode(Node):
     def __init__(self):
-        super().__init__("EKFNode")
+        super().__init__('EKFNode')
 
-
+        # Odometria y posicion inicial seleccionada con 2D Pose Estimate.
         self.subscription_odom = self.create_subscription(
-            Odometry, "/calc_odom", self.odom_callback, 10
+            Odometry, '/calc_odom', self.odom_callback, 10
+        )
+        self.initial_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/initialpose',
+            self.initial_pose_callback, 10
         )
 
-        self.last_odom = (0,0,0)  # Store previous odometry state
+        # Los landmarks del mapa son publicados con TRANSIENT_LOCAL.
+        # Este QoS permite recibir el ultimo mapa aun si el EKF inicia despues.
+        landmark_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
+        self.landmarks_sub = self.create_subscription(
+            PoseArray, '/landmarks', self.landmarks_callback, landmark_qos
+        )
+        self.observed_landmarks_sub = self.create_subscription(
+            PoseArray, '/observed_landmarks',
+            self.observed_landmarks_callback, 10
+        )
+
+        # Configuracion y estado previo de odometria.
+        self.last_odom = (0.0, 0.0, 0.0)
         self.read_odom = False
-
-        self.declare_parameter("path_min_dist", 0.05)
-        self.path_min_dist = self.get_parameter("path_min_dist").value
+        self.declare_parameter('path_min_dist', 0.05)
+        self.path_min_dist = float(self.get_parameter('path_min_dist').value)
         self.last_calc_xy = None
+        self.last_ekf_xy = None
 
-        self.calc_path_pub = self.create_publisher(Path, "/calc_robot_path", 10)
+        # Posicion estimada [x,y,yaw] y matriz de covarianza 3x3.
+        self.mu = None
+        self.Sigma = None
+        self.declare_parameter('init_std_xy', 0.5)
+        self.declare_parameter('init_std_yaw_deg', 10.0)
+        # Ruido del modelo de movimiento configurable.
+        self.declare_parameter('q_diag', 0.02)
+        self.Q = np.diag([0.02, 0.02, 0.02])
+
+        # Desvios estandar de la consigna: rango 0.06 m, angulo 0.07 rad.
+        self.R_measurement = np.diag([0.06 ** 2, 0.07 ** 2])
+
+        # Maxima diferencia permitida entre deteccion y prediccion
+        # al asociar landmarks. Ajustable sin editar el codigo.
+        self.declare_parameter('association_max_dist', 0.8)
+        self.association_max_dist = float(
+            self.get_parameter('association_max_dist').value
+        )
+        self.landmarks = None  # Array Nx2 de coordenadas globales del mapa.
+        self.observation_count = 0
+
+        self.calc_path_pub = self.create_publisher(
+            Path, '/calc_robot_path', 10
+        )
         self.calc_path_msg = Path()
-        self.calc_path_msg.header.frame_id = "map"
+        self.calc_path_msg.header.frame_id = 'map'
 
-        self.ekf_path_pub = self.create_publisher(Path, "/ekf_robot_path", 10)
+        self.ekf_path_pub = self.create_publisher(
+            Path, '/ekf_robot_path', 10
+        )
         self.ekf_path_msg = Path()
-        self.ekf_path_msg.header.frame_id = "map"
+        self.ekf_path_msg.header.frame_id = 'map'
 
         self.pub_pose_with_cov = self.create_publisher(
-            PoseWithCovarianceStamped, "/pose_with_covariance", 10
+            PoseWithCovarianceStamped, '/pose_with_covariance', 10
         )
 
-    def odom_callback(self, data: Odometry):
-        pose_stamped = PoseStamped()
-        pose_stamped.header.frame_id = "map"
-        pose_stamped.header.stamp = self.get_clock().now().to_msg()
-        pose_stamped.pose = data.pose.pose   # geometry_msgs/Pose
+    def initial_pose_callback(self, data: PoseWithCovarianceStamped):
+        """Inicializa el belief a partir de 2D Pose Estimate."""
+        x = data.pose.pose.position.x
+        y = data.pose.pose.position.y
+        q = data.pose.pose.orientation
+        theta = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
 
-        # Un punto cada `path_min_dist` metros. Sin este filtro el Path crece a
-        # 50 Hz y se republica entero en cada mensaje: se midieron 2.68 MB/s y
-        # 12486 poses en dos minutos, con lo que RViz se arrastra y parece culpa
-        # del filtro del alumno.
+        self.mu = np.array([x, y, theta], dtype=float)
+        # Sigma contiene VARIANZAS; se elevan al cuadrado los desvios.
+        std_xy = float(self.get_parameter('init_std_xy').value)
+        std_yaw = math.radians(
+            float(self.get_parameter('init_std_yaw_deg').value)
+        )
+        self.Sigma = np.diag([
+            std_xy ** 2,
+            std_xy ** 2,
+            std_yaw ** 2
+        ])
+
+        # Reiniciar trayectoria estimada cuando se elige otra pose inicial.
+        self.ekf_path_msg = Path()
+        self.ekf_path_msg.header.frame_id = 'map'
+        self.ekf_path_msg.header.stamp = self.get_clock().now().to_msg()
+        self.last_ekf_xy = None
+        self.ekf_path_pub.publish(self.ekf_path_msg)
+        self.publish_belief()
+        self.get_logger().info('EKF inicializado correctamente.')
+
+    def publish_belief(self):
+        """Publica mu, covarianza en formato ROS 6x6 y trayectoria EKF."""
+        if self.mu is None or self.Sigma is None:
+            return
+
+        x, y, theta = self.mu
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation = yaw_to_quaternion(float(theta))
+
+        # ROS usa las dimensiones [x,y,z,roll,pitch,yaw]; nuestro
+        # filtro estima [x,y,yaw], que corresponden a indices [0,1,5].
+        covariance = [0.0] * 36
+        indices = [0, 1, 5]
+        for i in range(3):
+            for j in range(3):
+                covariance[indices[i] * 6 + indices[j]] = float(
+                    self.Sigma[i, j]
+                )
+        msg.pose.covariance = covariance
+        self.pub_pose_with_cov.publish(msg)
+
+        current_xy = (float(x), float(y))
+        if (
+            self.last_ekf_xy is None or
+            math.dist(current_xy, self.last_ekf_xy) >= self.path_min_dist
+        ):
+            pose_stamped = PoseStamped()
+            pose_stamped.header = msg.header
+            pose_stamped.pose = msg.pose.pose
+            self.ekf_path_msg.poses.append(pose_stamped)
+            self.ekf_path_msg.header.stamp = msg.header.stamp
+            self.last_ekf_xy = current_xy
+            self.ekf_path_pub.publish(self.ekf_path_msg)
+
+    def odom_callback(self, data: Odometry):
+        """Paso de prediccion: mu^- = g(mu,u), Sigma^- = G Sigma G^T + Q."""
+        # Conservar el trazado original de /calc_robot_path.
+        pose_stamped = PoseStamped()
+        pose_stamped.header.frame_id = 'map'
+        pose_stamped.header.stamp = self.get_clock().now().to_msg()
+        pose_stamped.pose = data.pose.pose
         xy = (data.pose.pose.position.x, data.pose.pose.position.y)
-        if self.last_calc_xy is None or math.dist(xy, self.last_calc_xy) >= self.path_min_dist:
+        if (
+            self.last_calc_xy is None or
+            math.dist(xy, self.last_calc_xy) >= self.path_min_dist
+        ):
             self.last_calc_xy = xy
             self.calc_path_msg.poses.append(pose_stamped)
-            self.calc_path_msg.header.stamp = self.get_clock().now().to_msg()
+            self.calc_path_msg.header.stamp = pose_stamped.header.stamp
             self.calc_path_pub.publish(self.calc_path_msg)
 
-        
+        x = data.pose.pose.position.x
+        y = data.pose.pose.position.y
+        q = data.pose.pose.orientation
+        theta = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+
+        if not self.read_odom:
+            self.last_odom = (x, y, theta)
+            self.read_odom = True
+            return
+
+        prev_x, prev_y, prev_theta = self.last_odom
+        self.last_odom = (x, y, theta)
+        if self.mu is None:
+            return
+
+        dx = x - prev_x
+        dy = y - prev_y
+        delta_theta = normalize_angle(theta - prev_theta)
+        delta_x_local = math.cos(prev_theta) * dx + math.sin(prev_theta) * dy
+        delta_y_local = -math.sin(prev_theta) * dx + math.cos(prev_theta) * dy
+
+        if (
+            abs(delta_x_local) < 1e-5 and
+            abs(delta_y_local) < 1e-5 and
+            abs(delta_theta) < 1e-5
+        ):
+            return
+
+        x_est, y_est, theta_est = self.mu
+        new_x = (
+            x_est + math.cos(theta_est) * delta_x_local
+            - math.sin(theta_est) * delta_y_local
+        )
+        new_y = (
+            y_est + math.sin(theta_est) * delta_x_local
+            + math.cos(theta_est) * delta_y_local
+        )
+        new_theta = normalize_angle(theta_est + delta_theta)
+
+        # Jacobiano de g respecto del estado anterior.
+        Gt = np.eye(3)
+        Gt[0, 2] = (
+            -math.sin(theta_est) * delta_x_local
+            - math.cos(theta_est) * delta_y_local
+        )
+        Gt[1, 2] = (
+            math.cos(theta_est) * delta_x_local
+            - math.sin(theta_est) * delta_y_local
+        )
+
+        # Leer Q en cada predicción para permitir experimentos
+        # mediante ros2 param set sin reiniciar el nodo.
+        q_diag = float(self.get_parameter('q_diag').value)
+        self.Q = np.eye(3) * q_diag
+
+        self.Sigma = Gt @ self.Sigma @ Gt.T + self.Q
+        self.Sigma = (self.Sigma + self.Sigma.T) / 2.0
+        self.mu = np.array([new_x, new_y, new_theta])
+        self.publish_belief()
+
+    def landmarks_callback(self, msg: PoseArray):
+        """Almacena los landmarks conocidos expresados en frame map."""
+        if msg.header.frame_id != 'map':
+            self.get_logger().warn(
+                f'/landmarks llego en frame {msg.header.frame_id}; '
+                'se esperan coordenadas en map.'
+            )
+            return
+        self.landmarks = np.array(
+            [[p.position.x, p.position.y] for p in msg.poses],
+            dtype=float
+        ).reshape((-1, 2))
+        self.get_logger().info(
+            f'EKF recibio {len(self.landmarks)} landmarks del mapa.'
+        )
+
+    def observed_landmarks_callback(self, msg: PoseArray):
+        """Asocia detecciones locales a landmarks y corrige el belief."""
+        if self.mu is None or self.landmarks is None:
+            return
+        if len(self.landmarks) == 0:
+            return
+        if msg.header.frame_id != 'base_footprint':
+            self.get_logger().warn(
+                f'/observed_landmarks llego en frame {msg.header.frame_id}; '
+                'se esperan coordenadas en base_footprint.'
+            )
+            return
+
+        # El simulador rellena con (0,0) los landmarks no observados.
+        observed = np.array([
+            [p.position.x, p.position.y]
+            for p in msg.poses
+            if (abs(p.position.x) > 1e-8 or abs(p.position.y) > 1e-8)
+            and math.isfinite(p.position.x) and math.isfinite(p.position.y)
+        ], dtype=float).reshape((-1, 2))
+        if len(observed) == 0:
+            return
+
+        # Coordenadas locales predichas de cada landmark usando el
+        # belief ANTERIOR a la correccion del paquete de observaciones.
+        x, y, theta = self.mu
+        dx = self.landmarks[:, 0] - x
+        dy = self.landmarks[:, 1] - y
+        c, s = math.cos(theta), math.sin(theta)
+        predicted_local = np.column_stack((
+            c * dx + s * dy,
+            -s * dx + c * dy,
+        ))
+
+        # Asociacion global por distancia euclidiana con asignacion 1-a-1:
+        # el orden de las detecciones NO identifica los landmarks del mapa.
+        distances = np.linalg.norm(
+            observed[:, None, :] - predicted_local[None, :, :],
+            axis=2
+        )
+        obs_indices, landmark_indices = linear_sum_assignment(distances)
+
+        matches = 0
+        for obs_idx, landmark_idx in zip(obs_indices, landmark_indices):
+            # Descartar asociaciones demasiado alejadas de la prediccion.
+            if distances[obs_idx, landmark_idx] > self.association_max_dist:
+                continue
+
+            ox, oy = observed[obs_idx]
+            z = np.array([math.hypot(ox, oy), math.atan2(oy, ox)])
+            lx, ly = self.landmarks[landmark_idx]
+
+            # Modelo h(mu, landmark) de rango y bearing.
+            x, y, theta = self.mu
+            delta_x = lx - x
+            delta_y = ly - y
+            q = delta_x**2 + delta_y**2
+            if q < 1e-10:
+                continue
+            predicted_range = math.sqrt(q)
+            predicted_bearing = normalize_angle(
+                math.atan2(delta_y, delta_x) - theta
+            )
+            z_hat = np.array([predicted_range, predicted_bearing])
+            innovation = z - z_hat
+            innovation[1] = normalize_angle(innovation[1])
+
+            # Jacobiano H de h respecto del estado [x, y, yaw].
+            Ht = np.array([
+                [-delta_x / predicted_range, -delta_y / predicted_range, 0.0],
+                [delta_y / q, -delta_x / q, -1.0],
+            ])
+            S = Ht @ self.Sigma @ Ht.T + self.R_measurement
+
+            # Filtro de innovaciones incompatibles (99%, 2 dimensiones).
+            if float(innovation @ np.linalg.solve(S, innovation)) > 9.21:
+                continue
+
+            # Ganancia de Kalman y correccion de la media.
+            K = self.Sigma @ Ht.T @ np.linalg.inv(S)
+            self.mu = self.mu + K @ innovation
+            self.mu[2] = normalize_angle(self.mu[2])
+
+            # Forma de Joseph para preservar simetria y positividad.
+            identity = np.eye(3)
+            correction = identity - K @ Ht
+            self.Sigma = (
+                correction @ self.Sigma @ correction.T
+                + K @ self.R_measurement @ K.T
+            )
+            self.Sigma = (self.Sigma + self.Sigma.T) / 2.0
+            matches += 1
+
+        if matches > 0:
+            self.publish_belief()
+
+        self.observation_count += 1
+        if self.observation_count % 20 == 0:
+            self.get_logger().info(
+                f'Landmarks observados: {len(observed)}; '
+                f'asociados y usados: {matches}.'
+            )
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = EKFNode()
-    
     try:
-        rclpy.spin(node)  # Keep ROS 2 running
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print('\nShutting down...')
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
